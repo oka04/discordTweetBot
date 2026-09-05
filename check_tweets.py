@@ -19,6 +19,8 @@ ERROR_UNKNOWN = "E999"
 
 ERROR_LIST_NOTE = "エラー一覧.md"
 
+MAX_PAGES = 10  # 取りこぼし防止のため、最大でこのページ数までさかのぼって確認する
+
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -60,6 +62,57 @@ def build_error_message(error_code: str, exc: Exception) -> str:
     )
 
 
+async def collect_new_tweets(client: Client, user_id: str, last_seen_id: str | None) -> list:
+    """
+    last_seen_idより新しいツイートを、必要なら複数ページさかのぼって集める。
+
+    「先頭のツイートが古かったら即座に打ち切る」という判定方法だと、
+    ・実行間隔が長く空いて1ページ分より多く投稿されていた場合
+    ・ピン留めツイートが先頭に出てきて古いIDのまま並んでいる場合
+    に新しい投稿を見逃してしまうため、ページの中身を全部確認してから
+    次のページに進むかどうかを判断する方式にしている。
+    """
+    last_seen_id_int = int(last_seen_id) if last_seen_id is not None else None
+
+    new_tweets = []
+    page = await client.get_user_tweets(user_id, "Tweets")
+    pages_checked = 0
+
+    while page:
+        pages_checked += 1
+        page_has_new = False
+
+        for tweet in page:
+            tweet_id_int = int(tweet.id)
+            if last_seen_id_int is None or tweet_id_int > last_seen_id_int:
+                new_tweets.append(tweet)
+                page_has_new = True
+
+        # 初回実行(まだlast_seen_idが無い)は、過去分を大量通知しないよう
+        # 1ページ目だけ確認して終わりにする
+        if last_seen_id_int is None:
+            break
+
+        # このページに新しい投稿が1件も無ければ、十分さかのぼれたと判断して終了
+        if not page_has_new:
+            break
+
+        if pages_checked >= MAX_PAGES:
+            print(
+                f"警告: {MAX_PAGES}ページ確認しましたが、まだ新しい投稿がありそうです。"
+                "取りこぼしが出た可能性があります。"
+            )
+            break
+
+        try:
+            page = await page.next()
+        except Exception:
+            break
+
+    new_tweets.sort(key=lambda t: int(t.id))
+    return new_tweets
+
+
 async def check_and_notify() -> None:
     client = Client(language="ja-JP")
 
@@ -67,26 +120,21 @@ async def check_and_notify() -> None:
     client.set_cookies(cookies)
 
     user = await client.get_user_by_screen_name(TARGET_USERNAME)
-    tweets = await client.get_user_tweets(user.id, "Tweets")
 
     state = load_state()
     last_seen_id = state.get("last_seen_id")
 
-    new_tweets = []
-    for tweet in tweets:
-        if last_seen_id is not None and int(tweet.id) <= int(last_seen_id):
-            break
-        new_tweets.append(tweet)
+    new_tweets = await collect_new_tweets(client, user.id, last_seen_id)
 
     if not new_tweets:
         print("新しい投稿はありませんでした。")
     else:
-        for tweet in reversed(new_tweets):
+        for tweet in new_tweets:
             tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{tweet.id}"
             post_to_discord(tweet_url)
             print(f"投稿しました: {tweet_url}")
 
-        state["last_seen_id"] = new_tweets[0].id
+        state["last_seen_id"] = new_tweets[-1].id
 
     state["last_notification_was_error"] = False
     save_state(state)
