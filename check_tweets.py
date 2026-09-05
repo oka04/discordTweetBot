@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 
@@ -20,6 +21,8 @@ ERROR_UNKNOWN = "E999"
 ERROR_LIST_NOTE = "エラー一覧.md"
 
 MAX_PAGES = 10  # 取りこぼし防止のため、最大でこのページ数までさかのぼって確認する
+POST_INTERVAL_SECONDS = 2  # Discordへの連続投稿の間隔(レート制限回避のため)
+DISCORD_MAX_RETRIES = 5
 
 
 def load_state() -> dict:
@@ -36,8 +39,31 @@ def save_state(state: dict) -> None:
 
 
 def post_to_discord(content: str) -> None:
-    response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
-    response.raise_for_status()
+    """
+    DiscordのWebhookは短時間に連続で送るとレート制限(429)を返してくる。
+    429が返ってきた場合は、Discordが教えてくれる「あと何秒待って」という
+    値(retry_after)の分だけ待ってから、自動でもう一度送り直す。
+    """
+    for attempt in range(1, DISCORD_MAX_RETRIES + 1):
+        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+
+        if response.status_code == 429:
+            try:
+                retry_after = response.json().get("retry_after", 1)
+            except ValueError:
+                retry_after = 1
+            wait_seconds = float(retry_after) + 0.5
+            print(
+                f"Discordのレート制限に達しました。{wait_seconds:.1f}秒待ってリトライします "
+                f"({attempt}/{DISCORD_MAX_RETRIES}回目)"
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        response.raise_for_status()
+        return
+
+    raise RuntimeError("Discordへの投稿がリトライ上限に達しました(レート制限が解消しませんでした)")
 
 
 def classify_error(exc: Exception) -> str:
@@ -88,12 +114,9 @@ async def collect_new_tweets(client: Client, user_id: str, last_seen_id: str | N
                 new_tweets.append(tweet)
                 page_has_new = True
 
-        # 初回実行(まだlast_seen_idが無い)は、過去分を大量通知しないよう
-        # 1ページ目だけ確認して終わりにする
         if last_seen_id_int is None:
             break
 
-        # このページに新しい投稿が1件も無ければ、十分さかのぼれたと判断して終了
         if not page_has_new:
             break
 
@@ -128,16 +151,25 @@ async def check_and_notify() -> None:
 
     if not new_tweets:
         print("新しい投稿はありませんでした。")
-    else:
-        for tweet in new_tweets:
-            tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{tweet.id}"
-            post_to_discord(tweet_url)
-            print(f"投稿しました: {tweet_url}")
+        state["last_notification_was_error"] = False
+        save_state(state)
+        return
 
-        state["last_seen_id"] = new_tweets[-1].id
+    for index, tweet in enumerate(new_tweets):
+        tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{tweet.id}"
+        post_to_discord(tweet_url)
+        print(f"投稿しました: {tweet_url}")
 
-    state["last_notification_was_error"] = False
-    save_state(state)
+        # 1件送るたびに、その都度「ここまで送った」を保存しておく。
+        # こうしておけば、この後の投稿でエラーが起きても、
+        # 既に送信済みの分を次回また送り直してしまうことがない。
+        state["last_seen_id"] = tweet.id
+        state["last_notification_was_error"] = False
+        save_state(state)
+
+        is_last = index == len(new_tweets) - 1
+        if not is_last:
+            time.sleep(POST_INTERVAL_SECONDS)
 
 
 async def main() -> None:
