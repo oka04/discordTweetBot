@@ -23,6 +23,21 @@ ERROR_LIST_NOTE = "エラー一覧.md"
 MAX_PAGES = 10  # 取りこぼし防止のため、最大でこのページ数までさかのぼって確認する
 POST_INTERVAL_SECONDS = 2  # Discordへの連続投稿の間隔(レート制限回避のため)
 DISCORD_MAX_RETRIES = 5
+PINNED_TWEET_CHECK_COUNT = 2  # 固定ツイート対策として、無条件にチェックする先頭の件数
+
+
+class PartialSendError(Exception):
+    """新しい投稿の一部しか送信できなかったことを表す例外"""
+
+    def __init__(self, sent_count: int, total_count: int, original_error: Exception):
+        self.sent_count = sent_count
+        self.total_count = total_count
+        self.original_error = original_error
+        remaining = total_count - sent_count
+        super().__init__(
+            f"{total_count}件中{sent_count}件送信した時点でエラーが発生し、"
+            f"残り{remaining}件が未送信です。"
+        )
 
 
 def load_state() -> dict:
@@ -67,9 +82,21 @@ def post_to_discord(content: str) -> None:
 
 
 def classify_error(exc: Exception) -> str:
+    if isinstance(exc, PartialSendError):
+        exc = exc.original_error
+
+    exception_name = type(exc).__name__.lower()
     message = str(exc).lower()
 
-    if "login" in message or "auth" in message or "unauthorized" in message or "401" in message:
+    if (
+        "login" in message
+        or "log in" in message
+        or "auth" in message
+        or "unauthorized" in message
+        or "401" in message
+        or "invalidsession" in exception_name
+        or "logged-out" in message
+    ):
         return ERROR_LOGIN_FAILED
     if "not found" in message or "does not exist" in message or "404" in message:
         return ERROR_USER_NOT_FOUND
@@ -92,11 +119,10 @@ async def collect_new_tweets(client: Client, user_id: str, last_seen_id: str | N
     """
     last_seen_idより新しいツイートを、必要なら複数ページさかのぼって集める。
 
-    「先頭のツイートが古かったら即座に打ち切る」という判定方法だと、
-    ・実行間隔が長く空いて1ページ分より多く投稿されていた場合
-    ・ピン留めツイートが先頭に出てきて古いIDのまま並んでいる場合
-    に新しい投稿を見逃してしまうため、ページの中身を全部確認してから
-    次のページに進むかどうかを判断する方式にしている。
+    先頭2件は固定ツイートが混ざっている可能性があるので、新しいかどうかに
+    関わらず無条件にチェックする。3件目以降は、新しい投稿が続く限り見ていき、
+    新しくない投稿に出会った時点でそのページの確認を打ち切る。
+    1ページ全部が新しい投稿だった場合は、次のページも確認しに行く。
     """
     last_seen_id_int = int(last_seen_id) if last_seen_id is not None else None
 
@@ -106,18 +132,26 @@ async def collect_new_tweets(client: Client, user_id: str, last_seen_id: str | N
 
     while page:
         pages_checked += 1
-        page_has_new = False
+        page_tweets = list(page)
+        stopped_early = False
 
-        for tweet in page:
+        for position, tweet in enumerate(page_tweets):
             tweet_id_int = int(tweet.id)
-            if last_seen_id_int is None or tweet_id_int > last_seen_id_int:
+            is_new = last_seen_id_int is None or tweet_id_int > last_seen_id_int
+
+            if is_new:
                 new_tweets.append(tweet)
-                page_has_new = True
+            elif position >= PINNED_TWEET_CHECK_COUNT:
+                stopped_early = True
+                break
+            # position が先頭数件以内で新しくなかった場合は、固定ツイートの
+            # 可能性があるので打ち切らずに次の判定へ進む
 
         if last_seen_id_int is None:
+            # 初回実行時は過去分を大量通知しないよう、1ページ目だけ見て終わる
             break
 
-        if not page_has_new:
+        if stopped_early:
             break
 
         if pages_checked >= MAX_PAGES:
@@ -157,7 +191,14 @@ async def check_and_notify() -> None:
 
     for index, tweet in enumerate(new_tweets):
         tweet_url = f"https://x.com/{TARGET_USERNAME}/status/{tweet.id}"
-        post_to_discord(tweet_url)
+
+        try:
+            post_to_discord(tweet_url)
+        except Exception as exc:
+            raise PartialSendError(
+                sent_count=index, total_count=len(new_tweets), original_error=exc
+            ) from exc
+
         print(f"投稿しました: {tweet_url}")
 
         # 1件送るたびに、その都度「ここまで送った」を保存しておく。
@@ -173,6 +214,9 @@ async def check_and_notify() -> None:
 
 
 async def main() -> None:
+    state_before_run = load_state()
+    was_previously_errored = state_before_run.get("last_notification_was_error", False)
+
     try:
         await check_and_notify()
     except Exception as exc:
@@ -197,6 +241,14 @@ async def main() -> None:
         save_state(state)
 
         raise
+    else:
+        if was_previously_errored:
+            try:
+                post_to_discord("\u2705 前回発生していたエラーから復旧し、正常に動作しています。")
+                print("復旧通知をDiscordに送信しました。")
+            except Exception:
+                print("復旧通知の送信に失敗しました。")
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
