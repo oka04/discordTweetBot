@@ -10,6 +10,8 @@ from twikit import Client
 
 STATE_FILE = Path("last_seen.json")
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+# エラー通知専用のWebhook。未設定(空)の場合は、ツイート通知と同じチャンネルに送る
+DISCORD_ERROR_WEBHOOK_URL = os.environ.get("DISCORD_ERROR_WEBHOOK_URL") or DISCORD_WEBHOOK_URL
 TARGET_USERNAME = os.environ["TARGET_USERNAME"]
 
 ERROR_LOGIN_FAILED = "E001"
@@ -53,14 +55,19 @@ def save_state(state: dict) -> None:
     )
 
 
-def post_to_discord(content: str) -> None:
+def post_to_discord(content: str, webhook_url: str | None = None) -> None:
     """
     DiscordのWebhookは短時間に連続で送るとレート制限(429)を返してくる。
     429が返ってきた場合は、Discordが教えてくれる「あと何秒待って」という
     値(retry_after)の分だけ待ってから、自動でもう一度送り直す。
+
+    webhook_url を指定するとそのチャンネルに送る。
+    指定しなかった場合は、ツイート通知用のチャンネルに送る。
     """
+    target_url = webhook_url or DISCORD_WEBHOOK_URL
+
     for attempt in range(1, DISCORD_MAX_RETRIES + 1):
-        response = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+        response = requests.post(target_url, json={"content": content})
 
         if response.status_code == 429:
             try:
@@ -232,7 +239,10 @@ async def main() -> None:
             )
         else:
             try:
-                post_to_discord(build_error_message(error_code, exc))
+                post_to_discord(
+                    build_error_message(error_code, exc),
+                    DISCORD_ERROR_WEBHOOK_URL,
+                )
             except Exception:
                 print("Discordへのエラー通知自体にも失敗しました。")
                 traceback.print_exc()
@@ -244,7 +254,10 @@ async def main() -> None:
     else:
         if was_previously_errored:
             try:
-                post_to_discord("\u2705 前回発生していたエラーから復旧し、正常に動作しています。")
+                post_to_discord(
+                    "\u2705 前回発生していたエラーから復旧し、正常に動作しています。",
+                    DISCORD_ERROR_WEBHOOK_URL,
+                )
                 print("復旧通知をDiscordに送信しました。")
             except Exception:
                 print("復旧通知の送信に失敗しました。")
