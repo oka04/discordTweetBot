@@ -21,6 +21,7 @@ jobs:
       - name: Run checker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_ERROR_WEBHOOK_URL: ${{ secrets.DISCORD_ERROR_WEBHOOK_URL }}
           TARGET_USERNAME: ${{ secrets.TARGET_USERNAME }}
           X_COOKIES: ${{ secrets.X_COOKIES }}
         run: python check_tweets.py
